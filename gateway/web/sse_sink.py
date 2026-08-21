@@ -124,18 +124,22 @@ class SSEOutputSink:
             logger.debug("sse sink emit failed", exc_info=True)
 
 
-async def iter_investigation_sse(
+def iter_investigation_sse(
     run: Callable[[], Mapping[str, Any]],
     *,
     on_finished: Callable[[], None] | None = None,
 ) -> AsyncIterator[str]:
     """Run ``run`` in a worker thread and yield SSE frames as progress arrives.
 
+    The worker starts as soon as this function is called — not when the
+    caller first iterates — so ``on_finished`` still runs if the HTTP client
+    disconnects before the streaming body is consumed. That keeps a capacity
+    slot from leaking.
+
     ``run`` is the same investigation callable as ``POST /investigate``. Progress
     is bound for that thread only via :func:`progress_tracker_scope`.
     ``on_finished`` runs on the worker thread after the investigation ends
-    (success or failure) so a capacity slot can be released even if the HTTP
-    client has already disconnected.
+    (success or failure).
     """
     loop = asyncio.get_running_loop()
     items: asyncio.Queue[object] = asyncio.Queue()
@@ -171,16 +175,20 @@ async def iter_investigation_sse(
         name="investigate-sse",
     )
     thread.start()
-    while True:
-        try:
-            item = await asyncio.wait_for(items.get(), timeout=_SSE_KEEPALIVE_SECONDS)
-        except TimeoutError:
-            yield ": keepalive\n\n"
-            continue
-        if item is _DONE:
-            break
-        if isinstance(item, dict):
-            yield format_sse(item)
+
+    async def _frames() -> AsyncIterator[str]:
+        while True:
+            try:
+                item = await asyncio.wait_for(items.get(), timeout=_SSE_KEEPALIVE_SECONDS)
+            except TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            if item is _DONE:
+                break
+            if isinstance(item, dict):
+                yield format_sse(item)
+
+    return _frames()
 
 
 __all__ = [

@@ -163,6 +163,31 @@ async def test_iter_investigation_sse_yields_tool_call_before_run_returns() -> N
     assert returned.is_set() is True
 
 
+@pytest.mark.anyio
+async def test_iter_investigation_sse_releases_slot_if_never_iterated() -> None:
+    """Worker starts on construction so a dropped HTTP body cannot leak capacity."""
+    from platform.turn_host.concurrency import TurnConcurrencyGate
+
+    gate = TurnConcurrencyGate(1)
+    assert gate.try_acquire() is True
+    released = threading.Event()
+
+    def _run() -> dict[str, Any]:
+        return _fake_payload()
+
+    def _on_finished() -> None:
+        gate.release()
+        released.set()
+
+    agen = iter_investigation_sse(_run, on_finished=_on_finished)
+    try:
+        assert released.wait(timeout=5) is True
+        assert gate.try_acquire() is True
+        gate.release()
+    finally:
+        await agen.aclose()
+
+
 def test_stream_pipeline_failure_emits_error_without_leaking_exception_text(
     client: TestClient,
 ) -> None:

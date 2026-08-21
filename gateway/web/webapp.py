@@ -257,6 +257,8 @@ async def investigate_stream(
     def _run() -> dict[str, Any]:
         return _execute_investigation(req).model_dump()
 
+    # Start the worker before returning the response so a disconnect that
+    # never iterates the body still runs ``on_finished`` and releases the slot.
     return StreamingResponse(
         iter_investigation_sse(_run, on_finished=gate.release),
         media_type=SSE_MEDIA_TYPE,
