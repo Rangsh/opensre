@@ -169,6 +169,33 @@ def test_path2_sync_investigate_busy_drops_when_gate_full(
     reset_process_turn_gate_for_tests()
 
 
+def test_path2_stream_investigate_busy_drops_when_gate_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /investigate/stream shares process_turn_gate — try_acquire like chat."""
+    from fastapi.testclient import TestClient
+
+    from gateway.web import webapp
+    from platform.turn_host.concurrency import (
+        TurnConcurrencyGate,
+        reset_process_turn_gate_for_tests,
+        set_process_turn_gate,
+    )
+
+    reset_process_turn_gate_for_tests()
+    gate = TurnConcurrencyGate(1)
+    assert gate.try_acquire() is True
+    set_process_turn_gate(gate)
+    monkeypatch.setattr(webapp, "_gateway_auth_error", lambda _req: None)
+
+    client = TestClient(webapp.app)
+    resp = client.post("/investigate/stream", json={"raw_alert": {"alert_name": "x"}})
+    assert resp.status_code == HTTPStatus.SERVICE_UNAVAILABLE
+    assert "capacity" in resp.json()["error"].lower()
+    gate.release()
+    reset_process_turn_gate_for_tests()
+
+
 def test_investigation_worker_waits_for_the_same_chat_capacity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

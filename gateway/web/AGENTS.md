@@ -25,7 +25,7 @@ safe to re-enter, not invent a divergent registry.
 
 ## Capacity
 
-`POST /investigate` and `InvestigationWorker` take
+`POST /investigate`, `POST /investigate/stream`, and `InvestigationWorker` take
 :func:`~platform.turn_host.concurrency.process_turn_gate` — the same
 process gate as chat/scheduler (`OPENSRE_SIZE_PROFILE`). Sync HTTP
 `try_acquire` → 503 when full; the worker `acquire`s (blocking) after claim.

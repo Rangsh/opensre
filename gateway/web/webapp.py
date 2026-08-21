@@ -2,10 +2,11 @@
 
 Every HTTP endpoint OpenSRE serves lives here, on one port — ``/`` ``/health``
 ``/ok`` (health probes), ``/healthz`` (liveness), ``POST /alerts`` (external
-alert pushes into the process-wide :class:`AlertInbox`), and ``POST /investigate``
-(run an investigation synchronously and return the RCA report). Hosted by the
-gateway daemon and the interactive shell via :mod:`gateway.web.web_server`, or
-standalone via ``uvicorn gateway.web.webapp:app``.
+alert pushes into the process-wide :class:`AlertInbox`), ``POST /investigate``
+(run an investigation synchronously and return the RCA report), and
+``POST /investigate/stream`` (same investigation with Server-Sent Events
+progress). Hosted by the gateway daemon and the interactive shell via
+:mod:`gateway.web.web_server`, or standalone via ``uvicorn gateway.web.webapp:app``.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from http import HTTPStatus
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 from config.config import LLMSettings, get_environment
@@ -40,6 +41,7 @@ from gateway.core.process.readiness import is_gateway_ready  # noqa: E402
 from gateway.core.storage import open_database  # noqa: E402
 from gateway.core.storage.investigations.repository import investigation_repository  # noqa: E402
 from gateway.web.investigations import router as investigations_router  # noqa: E402
+from gateway.web.sse_sink import SSE_HEADERS, SSE_MEDIA_TYPE, iter_investigation_sse  # noqa: E402
 from platform.observability.errors.sentry import capture_exception  # noqa: E402
 from platform.process.turn_capacity import turn_slot  # noqa: E402
 from tools.investigation.capability import resolve_investigation_context  # noqa: E402
@@ -117,8 +119,9 @@ def _alert_inbox() -> AlertInbox:
 def _gateway_auth_error(request: Request) -> JSONResponse | None:
     """Bearer-token auth when configured; otherwise loopback callers only.
 
-    Shared by every mutating gateway route (``/alerts``, ``/investigate``) since
-    they sit behind the same trust boundary: local callers or a configured token.
+    Shared by every mutating gateway route (``/alerts``, ``/investigate``,
+    ``/investigate/stream``) since they sit behind the same trust boundary:
+    local callers or a configured token.
     """
     token = os.environ.get("OPENSRE_ALERT_LISTENER_TOKEN")
     if token:
@@ -228,19 +231,57 @@ def investigate(req: InvestigateRequest, request: Request) -> InvestigateRespons
         return _run_investigation(req)
 
 
-def _run_investigation(req: InvestigateRequest) -> InvestigateResponse | JSONResponse:
-    """Run one investigation and shape the response; capacity is the caller's."""
+@app.post("/investigate/stream", response_model=None)
+async def investigate_stream(
+    req: InvestigateRequest, request: Request
+) -> StreamingResponse | JSONResponse:
+    """Stream investigation progress as Server-Sent Events.
+
+    Same auth, body, capacity gate, and final report fields as
+    ``POST /investigate``. Each ``data:`` line is one JSON object (``tool_call``,
+    ``progress``, ``complete``, or ``error``). Closing the stream does not cancel
+    the investigation; the turn slot is held until the pipeline finishes.
+    """
+    if (auth_error := _gateway_auth_error(request)) is not None:
+        return auth_error
+
+    from platform.turn_host.concurrency import AT_CAPACITY_MESSAGE, process_turn_gate
+
+    gate = process_turn_gate()
+    if not gate.try_acquire():
+        return JSONResponse(
+            {"error": AT_CAPACITY_MESSAGE},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+    def _run() -> dict[str, Any]:
+        return _execute_investigation(req).model_dump()
+
+    return StreamingResponse(
+        iter_investigation_sse(_run, on_finished=gate.release),
+        media_type=SSE_MEDIA_TYPE,
+        headers=SSE_HEADERS,
+    )
+
+
+def _execute_investigation(req: InvestigateRequest) -> InvestigateResponse:
+    """Run one investigation and shape the wire-format response."""
     investigation_metadata = resolve_investigation_context(
         raw_alert=req.raw_alert,
         alert_name=req.alert_name,
         severity=req.severity,
     )
+    result = AgentSession().investigate(
+        req.raw_alert,
+        investigation_metadata=investigation_metadata,
+    )
+    return InvestigateResponse(**result.as_dict())
+
+
+def _run_investigation(req: InvestigateRequest) -> InvestigateResponse | JSONResponse:
+    """Run one investigation; convert failures to an opaque HTTP error."""
     try:
-        result = AgentSession().investigate(
-            req.raw_alert,
-            investigation_metadata=investigation_metadata,
-        )
-        return InvestigateResponse(**result.as_dict())
+        return _execute_investigation(req)
     except Exception as exc:
         # Full detail (which may include internal paths, stack context, or
         # upstream error bodies) goes to logs/Sentry only. The HTTP response

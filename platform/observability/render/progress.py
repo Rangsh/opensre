@@ -13,7 +13,9 @@ the adapter — they're not the core's concern.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Protocol
 
 
@@ -125,20 +127,44 @@ class NoopProgressTracker:
 _tracker: ProgressReporter = NoopProgressTracker()
 _tracker_factory: Callable[[], ProgressReporter] | None = None
 _silenced: bool = False
+_context_tracker: ContextVar[ProgressReporter | None] = ContextVar(
+    "opensre_progress_tracker", default=None
+)
 
 
 def get_progress_tracker() -> ProgressReporter:
     """Return the currently-registered tracker (or the Noop default).
+
+    A :func:`progress_tracker_scope` binding, when present, wins over the
+    process-global tracker so concurrent HTTP investigations do not mix
+    progress events.
 
     When a CLI factory is registered and progress has not been silenced,
     the first call materializes the adapter lazily so ``ProgressReporter``
     is constructed after REPL boot (when ``_repl_progress_active()`` is
     accurate) rather than at process start-up.
     """
+    bound = _context_tracker.get()
+    if bound is not None:
+        return bound
     global _tracker
     if not _silenced and isinstance(_tracker, NoopProgressTracker) and _tracker_factory is not None:
         set_progress_tracker(_tracker_factory())
     return _tracker
+
+
+@contextmanager
+def progress_tracker_scope(tracker: ProgressReporter) -> Iterator[ProgressReporter]:
+    """Use ``tracker`` for :func:`get_progress_tracker` in this context only.
+
+    Copied threads (``contextvars.copy_context().run``) inherit the binding.
+    The process-global tracker is left unchanged.
+    """
+    token = _context_tracker.set(tracker)
+    try:
+        yield tracker
+    finally:
+        _context_tracker.reset(token)
 
 
 def set_progress_tracker_factory(factory: Callable[[], ProgressReporter] | None) -> None:

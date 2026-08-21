@@ -210,13 +210,14 @@ Two different **in-process** limits — do not conflate them:
 
 | Layer | Mechanism | Behavior when full |
 |-------|-----------|-------------------|
-| **Process** | `TurnConcurrencyGate` / `process_turn_gate()` from `OPENSRE_SIZE_PROFILE` (SMALL=1, MEDIUM=2, LARGE=4) | Chat + sync `/investigate`: non-blocking `try_acquire` (busy drop / 503). Scheduler + `InvestigationWorker`: **blocking** `acquire` (already-claimed work waits). |
+| **Process** | `TurnConcurrencyGate` / `process_turn_gate()` from `OPENSRE_SIZE_PROFILE` (SMALL=1, MEDIUM=2, LARGE=4) | Chat + sync `/investigate` + `/investigate/stream`: non-blocking `try_acquire` (busy drop / 503). Scheduler + `InvestigationWorker`: **blocking** `acquire` (already-claimed work waits). |
 | **Per-transport** | `max_concurrent_turns` (defaults to the same profile limit via `turn_limit_for_profile`; override with `*_GATEWAY_MAX_CONCURRENT`) | Caps how many inbound messages that transport may process in parallel *before* they hit the shared turn handler. Does not replace the process gate. |
 
 ```text
 Telegram/Slack/Discord ──► TurnHandler.try_acquire ──► process_turn_gate()
 Scheduler (agent + investigate runners) ──► blocking acquire ──► same gate
 POST /investigate ──► try_acquire (busy → 503) ──► same gate
+POST /investigate/stream ──► try_acquire (busy → 503) ──► same gate
 InvestigationWorker ──► blocking acquire (already claimed) ──► same gate
 ```
 
@@ -226,7 +227,7 @@ Production chat capacity is on `TurnHandler(gate=controller.turn_gate)`.
 `ConcurrencyLimitedTurnHandler` is tests-only; production uses `gate=` on
 `TurnHandler` only.
 
-HTTP `POST /investigate` busy-drops like chat. `InvestigationWorker` waits
+HTTP `POST /investigate` and `POST /investigate/stream` busy-drop like chat. `InvestigationWorker` waits
 like scheduler runners. Chat analytics use `gateway_turn_*` with `surface`
 in {slack, telegram, discord}; investigate uses `investigation_*` events
 (no dedicated capacity-reject event yet).

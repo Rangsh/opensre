@@ -17,7 +17,7 @@ the application.
 
 | Routes | Caller | Authentication |
 | --- | --- | --- |
-| `POST /alerts`, `POST /investigate` | Machines (alert sources, CI, schedulers) | Set `OPENSRE_ALERT_LISTENER_TOKEN` and send `Authorization: Bearer <token>`. If unset, only loopback callers are accepted. |
+| `POST /alerts`, `POST /investigate`, `POST /investigate/stream` | Machines (alert sources, CI, schedulers) | Set `OPENSRE_ALERT_LISTENER_TOKEN` and send `Authorization: Bearer <token>`. If unset, only loopback callers are accepted. |
 | `/api/investigations/*` | Users and web clients | Clerk JWT as `Authorization: Bearer <clerk-session-token>`. The token must include an organization; records are scoped to that organization. |
 | `GET /`, `/health`, `/ok`, `/healthz`, `/readyz` | Health probes | None |
 
@@ -67,6 +67,32 @@ Required field: `raw_alert`. Optional top-level fields: `alert_name`,
 
 Response fields: `report`, `problem_md`, `root_cause`, `is_noise`,
 `validity_score`, and optionally `tool_calls`.
+
+## Streaming investigation (SSE)
+
+Same body, auth, and capacity gate as `POST /investigate`, but progress is
+written as Server-Sent Events while the pipeline runs. Use `curl -N` so the
+client does not buffer the stream.
+
+```bash
+curl -N -X POST "https://<host>/investigate/stream" \
+  -H "Authorization: Bearer $OPENSRE_ALERT_LISTENER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"raw_alert": {"title": "HighCPU", "service": "payment-api"}}'
+```
+
+Each `data:` line is one JSON object:
+
+| `type` | When | Fields |
+| --- | --- | --- |
+| `tool_call` | A tool starts or finishes | `tool`, `status` (`running` or `done`), `summary` on `done` |
+| `progress` | A pipeline stage starts | `message` |
+| `complete` | The RCA is ready | Same fields as `POST /investigate` (`report`, `problem_md`, `root_cause`, `is_noise`, `validity_score`, optional `tool_calls`) |
+| `error` | The pipeline fails after the stream has started | `error` (exception type only) |
+
+Auth failures, missing `raw_alert`, and an at-capacity process still return JSON
+(`401` / `403` / `422` / `503`) before any SSE frames. Closing the connection
+does not cancel the investigation; the turn slot is held until it finishes.
 
 ## Asynchronous investigations (Clerk)
 
@@ -120,4 +146,4 @@ an organization returns `403`. Canceling a non-queued investigation returns
 | `404` | Unknown investigation ID, or one outside your organization |
 | `409` | Investigation is not cancellable (already claimed or finished) |
 | `413` | Alert body larger than 1 MiB |
-| `503` | LLM not configured (`/health`), gateway not ready (`/readyz`), or investigation pipeline failure |
+| `503` | LLM not configured (`/health`), gateway not ready (`/readyz`), process at capacity (`/investigate`, `/investigate/stream`), or a non-streaming investigation pipeline failure |

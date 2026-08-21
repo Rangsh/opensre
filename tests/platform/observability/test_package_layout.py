@@ -8,6 +8,7 @@ def test_public_observability_ports_still_export_from_package_root() -> None:
 
     assert hasattr(observability, "debug_print")
     assert hasattr(observability, "get_progress_tracker")
+    assert hasattr(observability, "progress_tracker_scope")
     assert hasattr(observability, "NoopProgressTracker")
     assert hasattr(observability, "get_output_format")
 

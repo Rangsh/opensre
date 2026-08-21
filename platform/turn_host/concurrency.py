@@ -1,9 +1,10 @@
 """Process-wide turn concurrency shared by every Gateway ingress.
 
 Production chat turns take the gate via :class:`TurnHandler` (``gate=``).
-``POST /investigate`` and :class:`InvestigationWorker` use the same process
-gate (:func:`process_turn_gate`) so HTTP investigate cannot starve chat or
-the reverse. Scheduled runs take the same instance: the controller builds
+``POST /investigate``, ``POST /investigate/stream``, and
+:class:`InvestigationWorker` use the same process gate
+(:func:`process_turn_gate`) so HTTP investigate cannot starve chat or the
+reverse. Scheduled runs take the same instance: the controller builds
 ``SchedulerRunners`` and calls ``.gated(turn_gate)`` before installing them.
 
 A callback wrapper for arbitrary handlers is tests-only, not production
