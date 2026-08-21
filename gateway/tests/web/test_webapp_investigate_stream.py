@@ -188,6 +188,39 @@ async def test_iter_investigation_sse_releases_slot_if_never_iterated() -> None:
         await agen.aclose()
 
 
+@pytest.mark.anyio
+async def test_iter_investigation_sse_releases_slot_if_thread_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``thread.start()`` failure must still return the capacity permit."""
+    from platform.turn_host.concurrency import TurnConcurrencyGate
+
+    gate = TurnConcurrencyGate(1)
+    assert gate.try_acquire() is True
+    released = threading.Event()
+
+    def _fail_start(_self: threading.Thread) -> None:
+        raise RuntimeError("can't start new thread")
+
+    def _run() -> dict[str, Any]:
+        return _fake_payload()
+
+    def _on_finished() -> None:
+        gate.release()
+        released.set()
+
+    monkeypatch.setattr(threading.Thread, "start", _fail_start)
+    agen = iter_investigation_sse(_run, on_finished=_on_finished)
+    try:
+        assert released.is_set() is True
+        events = _sse_events("".join([frame async for frame in agen]))
+        assert events == [{"type": "error", "error": "investigation failed: RuntimeError"}]
+        assert gate.try_acquire() is True
+        gate.release()
+    finally:
+        await agen.aclose()
+
+
 def test_stream_pipeline_failure_emits_error_without_leaking_exception_text(
     client: TestClient,
 ) -> None:

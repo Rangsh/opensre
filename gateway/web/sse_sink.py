@@ -139,7 +139,8 @@ def iter_investigation_sse(
     ``run`` is the same investigation callable as ``POST /investigate``. Progress
     is bound for that thread only via :func:`progress_tracker_scope`.
     ``on_finished`` runs on the worker thread after the investigation ends
-    (success or failure).
+    (success or failure), and also on the calling thread if ``thread.start()``
+    fails before ``_run`` can enter.
     """
     loop = asyncio.get_running_loop()
     items: asyncio.Queue[object] = asyncio.Queue()
@@ -174,7 +175,20 @@ def iter_investigation_sse(
         daemon=True,
         name="investigate-sse",
     )
-    thread.start()
+    try:
+        thread.start()
+    except Exception as exc:
+        # ``_run`` never entered, so its ``finally`` cannot release the turn slot.
+        logger.exception("Investigation SSE worker failed to start")
+        capture_exception(exc, context="gateway.web.sse_sink")
+        _enqueue(
+            loop,
+            items,
+            {"type": "error", "error": f"investigation failed: {type(exc).__name__}"},
+        )
+        _enqueue(loop, items, _DONE)
+        if on_finished is not None:
+            on_finished()
 
     async def _frames() -> AsyncIterator[str]:
         while True:
