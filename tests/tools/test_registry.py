@@ -12,6 +12,19 @@ from core.domain.types.retrieval import RetrievalControls
 from core.domain.types.tools import ToolSurface
 from core.tool.contracts import REGISTERED_TOOL_ATTR, BaseTool, RegisteredTool
 from core.tool_framework.tool_decorator import tool
+from tests.tools.property_description_allowlist import (
+    ACTIONABLE_PROPERTY_DESCRIPTION_ALLOWLIST,
+)
+from tests.tools.property_description_rules import (
+    RULE_ENUM,
+    RULE_EXCLUSIVE,
+    RULE_IDENTIFIER,
+    RULE_TIME,
+    collect_schema_violations,
+    collect_violations,
+    format_source_counts,
+    violations_by_source,
+)
 from tools import registry as registry_module
 from tools import registry_discovery
 from tools.investigation_registry.actions import get_available_actions
@@ -749,6 +762,10 @@ def _v2_tools() -> list[RegisteredTool]:
     ]
 
 
+def _deduped_registry_tools() -> list[RegisteredTool]:
+    return list({tool.name: tool for tool in registry_module.get_registered_tools()}.values())
+
+
 def test_v2_registry_tool_contracts_exist() -> None:
     discovered = {tool.name for tool in _v2_tools()}
     assert discovered == _V2_TOOL_CONTRACT_NAMES
@@ -778,6 +795,103 @@ def test_v2_registry_property_schemas_are_typed_and_described() -> None:
             assert str(prop_schema.get("description", "")).strip(), (
                 f"{tool_def.name}.{prop_name} must include description."
             )
+
+    violations = collect_violations(_deduped_registry_tools())
+    by_key = {violation.key: violation for violation in violations}
+    unexpected = sorted(
+        key for key in by_key if key not in ACTIONABLE_PROPERTY_DESCRIPTION_ALLOWLIST
+    )
+    stale = sorted(ACTIONABLE_PROPERTY_DESCRIPTION_ALLOWLIST - set(by_key))
+    assert unexpected == [], (
+        "Property descriptions must be actionable (units, enum values, identifier "
+        "kind, mutual exclusion). Fix the description or, for pre-existing debt, "
+        "add to the shrink-only allowlist in "
+        "tests/tools/property_description_allowlist.py:\n"
+        + "\n".join(f"  - {tool}.{prop} ({rule})" for tool, prop, rule in unexpected)
+        + "\n\nPer-source violator counts (including allowlisted):\n"
+        + format_source_counts(violations_by_source(violations))
+    )
+    assert stale == [], "Remove stale allowlist entries so it keeps shrinking:\n" + "\n".join(
+        f"  - {tool}.{prop} ({rule})" for tool, prop, rule in stale
+    )
+
+
+def test_actionable_property_description_time_rule_catches_missing_unit() -> None:
+    violations = collect_schema_violations(
+        tool_name="throwaway_time_rule",
+        source="knowledge",
+        schema={
+            "type": "object",
+            "properties": {
+                "start_time": {
+                    "type": "string",
+                    "description": "the start",
+                }
+            },
+        },
+    )
+    assert [violation.rule for violation in violations] == [RULE_TIME]
+
+
+def test_actionable_property_description_enum_rule_catches_missing_values() -> None:
+    violations = collect_schema_violations(
+        tool_name="throwaway_enum_rule",
+        source="knowledge",
+        schema={
+            "type": "object",
+            "properties": {
+                "state": {
+                    "type": "string",
+                    "enum": ["open", "closed"],
+                    "description": "Issue state filter.",
+                }
+            },
+        },
+    )
+    assert [violation.rule for violation in violations] == [RULE_ENUM]
+
+
+def test_actionable_property_description_identifier_rule_catches_missing_kind() -> None:
+    violations = collect_schema_violations(
+        tool_name="throwaway_identifier_rule",
+        source="knowledge",
+        schema={
+            "type": "object",
+            "properties": {
+                "incident_id": {
+                    "type": "string",
+                    "description": "the incident",
+                }
+            },
+        },
+    )
+    assert [violation.rule for violation in violations] == [RULE_IDENTIFIER]
+
+
+def test_actionable_property_description_exclusive_rule_catches_missing_hint() -> None:
+    violations = collect_schema_violations(
+        tool_name="throwaway_exclusive_rule",
+        source="knowledge",
+        schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "SQL query to execute.",
+                },
+                "query_file": {
+                    "type": "string",
+                    "description": "Path to a SQL file on disk.",
+                },
+            },
+            "oneOf": [
+                {"required": ["query"]},
+                {"required": ["query_file"]},
+            ],
+        },
+    )
+    assert {violation.rule for violation in violations} == {RULE_EXCLUSIVE}
+    assert {violation.property_name for violation in violations} == {"query", "query_file"}
 
 
 def test_v2_registry_required_fields_are_declared() -> None:
