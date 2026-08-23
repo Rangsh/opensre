@@ -44,6 +44,12 @@ def _skill_guidance_files() -> tuple[Path, ...]:
     return (*explicit, *discovered)
 
 
+def _is_token_char(ch: str) -> bool:
+    """Return whether ``ch`` continues an identifier-like token (e.g. ``foo_bar``)."""
+
+    return ch.isalnum() or ch == "_"
+
+
 def _truncate_skill_guidance(text: str) -> str:
     """Cap guidance at ``_MAX_TOOL_SKILL_GUIDANCE_CHARS``, ending on a word when possible."""
 
@@ -53,7 +59,12 @@ def _truncate_skill_guidance(text: str) -> str:
     chopped = text[:budget]
     # Back up to the last whitespace when the slice splits a token. A slice with
     # no whitespace is left as-is — cutting mid-word is then unavoidable.
-    if chopped and chopped[-1].isalnum() and budget < len(text) and text[budget].isalnum():
+    if (
+        chopped
+        and _is_token_char(chopped[-1])
+        and budget < len(text)
+        and _is_token_char(text[budget])
+    ):
         boundary = max(chopped.rfind(" "), chopped.rfind("\n"), chopped.rfind("\t"))
         if boundary > 0:
             chopped = chopped[:boundary]

@@ -235,6 +235,16 @@ def test_truncate_skill_guidance_does_not_split_a_word_when_a_boundary_exists() 
     assert not truncated[:-3].endswith("complete")
 
 
+def test_truncate_skill_guidance_does_not_split_before_an_underscore() -> None:
+    budget = _MAX_TOOL_SKILL_GUIDANCE_CHARS - 3
+    text = "x" * (budget - 4) + " foo_bar_rest"
+    assert len(text) > _MAX_TOOL_SKILL_GUIDANCE_CHARS
+    truncated = _truncate_skill_guidance(text)
+    assert truncated.endswith("...")
+    assert not truncated[:-3].endswith("foo")
+    assert "foo_bar" not in truncated
+
+
 def test_truncate_skill_guidance_keeps_a_single_overlong_token() -> None:
     text = "x" * (_MAX_TOOL_SKILL_GUIDANCE_CHARS + 20)
     truncated = _truncate_skill_guidance(text)
