@@ -374,7 +374,6 @@ _EXCLUSIVE_HINTS = (
 )
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
-_WORD_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
 
 
 class PropertyViolation(NamedTuple):
