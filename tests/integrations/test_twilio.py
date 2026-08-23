@@ -11,9 +11,7 @@ from integrations.probes import ProbeStatus
 from integrations.twilio.verifier import (
     TwilioValidationResult,
     validate_twilio_config,
-)
-from integrations.twilio.verifier import (
-    verify_twilio as _verify_twilio,
+    verify_twilio,
 )
 
 
@@ -87,7 +85,7 @@ def test_config_rejects_blank_auth_token() -> None:
         )
 
 
-# ---- _verify_twilio -----------------------------------------------------------
+# ---- verify_twilio ------------------------------------------------------------
 
 
 def test_validate_distinguishes_missing_from_api_failure(
@@ -132,13 +130,13 @@ def test_validate_passed_carries_ok_when_sms_ready(
 
 
 def test_verify_missing_account_sid() -> None:
-    result = _verify_twilio("env", {"auth_token": "tok"})
+    result = verify_twilio("env", {"auth_token": "tok"})
     assert result["status"] == "missing"
     assert "account_sid" in result["detail"].lower()
 
 
 def test_verify_missing_auth_token() -> None:
-    result = _verify_twilio("env", {"account_sid": "AC1"})
+    result = verify_twilio("env", {"account_sid": "AC1"})
     assert result["status"] == "missing"
     assert "auth_token" in result["detail"].lower()
 
@@ -149,7 +147,7 @@ def test_verify_passed_when_sms_ready(monkeypatch: pytest.MonkeyPatch) -> None:
         lambda *_a, **_kw: _FakeResponse({"friendly_name": "Demo"}),
     )
 
-    result = _verify_twilio(
+    result = verify_twilio(
         "env",
         {
             "account_sid": "AC1",
@@ -168,7 +166,7 @@ def test_verify_passed_with_messaging_service_sid(monkeypatch: pytest.MonkeyPatc
         lambda *_a, **_kw: _FakeResponse({"friendly_name": "Demo"}),
     )
 
-    result = _verify_twilio(
+    result = verify_twilio(
         "env",
         {
             "account_sid": "AC1",
@@ -186,7 +184,7 @@ def test_verify_failed_when_sms_not_ready(monkeypatch: pytest.MonkeyPatch) -> No
         lambda *_a, **_kw: _FakeResponse({"friendly_name": "Demo"}),
     )
 
-    result = _verify_twilio(
+    result = verify_twilio(
         "env",
         {
             "account_sid": "AC1",
@@ -205,7 +203,7 @@ def test_verify_failed_when_api_errors(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("integrations.twilio.verifier.requests.get", _raise)
 
-    result = _verify_twilio("env", {"account_sid": "AC1", "auth_token": "tok"})
+    result = verify_twilio("env", {"account_sid": "AC1", "auth_token": "tok"})
 
     assert result["status"] == "failed"
     assert "Connection timeout" in result["detail"]
