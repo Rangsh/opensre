@@ -7,7 +7,14 @@ from typing import Any
 import pytest
 
 from integrations.config_models import TwilioIntegrationConfig, TwilioSMSChannelConfig
-from integrations.twilio.verifier import verify_twilio as _verify_twilio
+from integrations.probes import ProbeStatus
+from integrations.twilio.verifier import (
+    TwilioValidationResult,
+    validate_twilio_config,
+)
+from integrations.twilio.verifier import (
+    verify_twilio as _verify_twilio,
+)
 
 
 class _FakeResponse:
@@ -81,6 +88,47 @@ def test_config_rejects_blank_auth_token() -> None:
 
 
 # ---- _verify_twilio -----------------------------------------------------------
+
+
+def test_validate_distinguishes_missing_from_api_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The typed result tells missing-credential from API-failure by status, not detail text."""
+    missing = validate_twilio_config({"auth_token": "tok"})
+    assert missing.status is ProbeStatus.MISSING
+    assert missing.ok is False
+
+    def _raise(*_a: Any, **_kw: Any) -> Any:
+        raise Exception("Connection timeout")
+
+    monkeypatch.setattr("integrations.twilio.verifier.requests.get", _raise)
+    failed = validate_twilio_config({"account_sid": "AC1", "auth_token": "tok"})
+
+    assert failed.status is ProbeStatus.FAILED
+    assert failed.ok is False
+    # Same ok=False, but the status field tells them apart without parsing detail.
+    assert missing.status is not failed.status
+    assert isinstance(missing, TwilioValidationResult)
+
+
+def test_validate_passed_carries_ok_when_sms_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "integrations.twilio.verifier.requests.get",
+        lambda *_a, **_kw: _FakeResponse({"friendly_name": "Demo"}),
+    )
+
+    validation = validate_twilio_config(
+        {
+            "account_sid": "AC1",
+            "auth_token": "tok",
+            "sms": {"enabled": True, "from_number": "+14155551111"},
+        }
+    )
+
+    assert validation.status is ProbeStatus.PASSED
+    assert validation.ok is True
 
 
 def test_verify_missing_account_sid() -> None:

@@ -8,21 +8,42 @@ standalone ``whatsapp`` integration.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import requests
 
+from integrations.probes import ProbeStatus
 from integrations.verification import register_verifier, result
 
 
-@register_verifier("twilio")
-def verify_twilio(source: str, config: dict[str, Any]) -> dict[str, str]:
+@dataclass(frozen=True)
+class TwilioValidationResult:
+    """Outcome of validating Twilio credentials and SMS channel readiness.
+
+    ``status`` is the discriminator: a missing credential (``MISSING``) is
+    distinct from an API or SMS-channel failure (``FAILED``) without parsing
+    ``detail``. ``ok`` is the posthog-style pass/fail view derived from it,
+    so callers that only need "did it pass" read ``ok`` exactly like
+    :class:`integrations.posthog.verifier.PostHogValidationResult`.
+    """
+
+    status: ProbeStatus
+    detail: str
+
+    @property
+    def ok(self) -> bool:
+        return self.status is ProbeStatus.PASSED
+
+
+def validate_twilio_config(config: dict[str, Any]) -> TwilioValidationResult:
+    """Authenticate the Twilio account and confirm the SMS channel is ready."""
     account_sid = str(config.get("account_sid", "")).strip()
     auth_token = str(config.get("auth_token", "")).strip()
     if not account_sid:
-        return result("twilio", source, "missing", "Missing account_sid.")
+        return TwilioValidationResult(status=ProbeStatus.MISSING, detail="Missing account_sid.")
     if not auth_token:
-        return result("twilio", source, "missing", "Missing auth_token.")
+        return TwilioValidationResult(status=ProbeStatus.MISSING, detail="Missing auth_token.")
 
     try:
         response = requests.get(
@@ -33,7 +54,9 @@ def verify_twilio(source: str, config: dict[str, Any]) -> dict[str, str]:
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
-        return result("twilio", source, "failed", f"Twilio API check failed: {exc}")
+        return TwilioValidationResult(
+            status=ProbeStatus.FAILED, detail=f"Twilio API check failed: {exc}"
+        )
 
     friendly_name = str(payload.get("friendly_name", "")).strip() or account_sid
 
@@ -44,19 +67,27 @@ def verify_twilio(source: str, config: dict[str, Any]) -> dict[str, str]:
     )
 
     if not sms_ready:
-        return result(
-            "twilio",
-            source,
-            "failed",
-            (
+        return TwilioValidationResult(
+            status=ProbeStatus.FAILED,
+            detail=(
                 f"Connected to Twilio account {friendly_name} but the SMS channel "
                 "is not ready. Enable SMS and set a from_number or messaging_service_sid."
             ),
         )
 
-    return result(
-        "twilio",
-        source,
-        "passed",
-        f"Connected to Twilio account {friendly_name}; SMS channel ready.",
+    return TwilioValidationResult(
+        status=ProbeStatus.PASSED,
+        detail=f"Connected to Twilio account {friendly_name}; SMS channel ready.",
     )
+
+
+@register_verifier("twilio")
+def verify_twilio(source: str, config: dict[str, Any]) -> dict[str, str]:
+    """Edge adapter: run the typed validation and convert at the registry boundary.
+
+    The registry contract is ``dict[str, str]`` (shared by all 64 verifiers);
+    the typed :class:`TwilioValidationResult` is an internal detail converted
+    here so the contract stays unchanged for everyone else.
+    """
+    validation = validate_twilio_config(config)
+    return result("twilio", source, validation.status.value, validation.detail)
