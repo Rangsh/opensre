@@ -617,9 +617,7 @@ def _enum_values_are_documented(values: Sequence[str], description: str) -> bool
 
 def _enum_value_in_description(value: str, description: str) -> bool:
     needle = value.lower()
-    if len(needle) <= 2:
-        return re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", description) is not None
-    return needle in description
+    return re.search(rf"(?<![a-z0-9]){re.escape(needle)}(?![a-z0-9])", description) is not None
 
 
 def _is_identifier_field(name: str) -> bool:
@@ -659,22 +657,21 @@ def _exclusive_property_groups(schema: Mapping[str, Any]) -> list[tuple[str, ...
     properties = schema.get("properties")
     names = set(properties) if isinstance(properties, dict) else set()
 
-    for key in ("oneOf", "anyOf"):
-        variants = schema.get(key)
-        if not isinstance(variants, list):
-            continue
+    # JSON Schema ``anyOf`` allows multiple branches to match, so it is not
+    # exclusive. Only ``oneOf`` is a true XOR of required properties.
+    variants = schema.get("oneOf")
+    if isinstance(variants, list):
         required_sets = [
             frozenset(str(item) for item in variant.get("required", []) if isinstance(item, str))
             for variant in variants
             if isinstance(variant, dict)
         ]
         required_sets = [group for group in required_sets if group]
-        if len(required_sets) < 2:
-            continue
-        counts: Counter[str] = Counter(name for group in required_sets for name in group)
-        exclusive = tuple(sorted(name for name, count in counts.items() if count == 1))
-        if len(exclusive) >= 2:
-            groups.append(exclusive)
+        if len(required_sets) >= 2:
+            counts: Counter[str] = Counter(name for group in required_sets for name in group)
+            exclusive = tuple(sorted(name for name, count in counts.items() if count == 1))
+            if len(exclusive) >= 2:
+                groups.append(exclusive)
 
     if not names:
         return groups

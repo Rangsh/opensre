@@ -894,6 +894,49 @@ def test_actionable_property_description_exclusive_rule_catches_missing_hint() -
     assert {violation.property_name for violation in violations} == {"query", "query_file"}
 
 
+def test_actionable_property_description_exclusive_rule_ignores_any_of() -> None:
+    violations = collect_schema_violations(
+        tool_name="throwaway_any_of_not_exclusive",
+        source="knowledge",
+        schema={
+            "type": "object",
+            "properties": {
+                "alpha": {
+                    "type": "string",
+                    "description": "First optional selector.",
+                },
+                "beta": {
+                    "type": "string",
+                    "description": "Second optional selector.",
+                },
+            },
+            "anyOf": [
+                {"required": ["alpha"]},
+                {"required": ["beta"]},
+            ],
+        },
+    )
+    assert violations == []
+
+
+def test_actionable_property_description_enum_rule_requires_token_boundaries() -> None:
+    violations = collect_schema_violations(
+        tool_name="throwaway_enum_token_boundary",
+        source="knowledge",
+        schema={
+            "type": "object",
+            "properties": {
+                "state": {
+                    "type": "string",
+                    "enum": ["open"],
+                    "description": "Issue state filter. Use opened or reopened.",
+                }
+            },
+        },
+    )
+    assert [violation.rule for violation in violations] == [RULE_ENUM]
+
+
 def test_v2_registry_required_fields_are_declared() -> None:
     for tool_def in _v2_tools():
         schema = tool_def.public_input_schema
