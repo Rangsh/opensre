@@ -89,6 +89,42 @@ tools:
     }
 
 
+def test_load_tool_skill_guidance_warns_on_unknown_tool_and_keeps_the_skill(
+    tmp_path: Path,
+) -> None:
+    """Unknown ``tools:`` targets warn today; the skill still loads with that name.
+
+    Pin the current behaviour: the loader does not fail the file, and the
+    unknown name stays on ``skill.tool_names`` so the registry can skip attach.
+    """
+
+    path = tmp_path / "SKILL.md"
+    _write_skill(
+        path,
+        """
+name: unknown-target-skill
+description: Guide a real tool and a missing one.
+tools:
+  - list_github_work_items
+  - definitely_not_a_registered_tool
+""".strip(),
+    )
+
+    result = load_tool_skill_guidance(
+        path,
+        known_tool_names=frozenset({"list_github_work_items"}),
+    )
+
+    assert result.skill is not None
+    assert result.skill.tool_names == (
+        "list_github_work_items",
+        "definitely_not_a_registered_tool",
+    )
+    unknown = [d for d in result.diagnostics if d.code == "unknown_tool"]
+    assert len(unknown) == 1
+    assert "definitely_not_a_registered_tool" in unknown[0].message
+
+
 def test_load_tool_skill_guidance_requires_description_and_tools(tmp_path: Path) -> None:
     path = tmp_path / "SKILL.md"
     _write_skill(path, "name: github-workflow")
