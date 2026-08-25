@@ -382,11 +382,14 @@ _FANOUT_TRANSPORTS = ("slack", "telegram", "discord")
 
 
 class _TransportSink:
-    """Stub chat-transport output: records the finalized reply for one actor.
+    """Stub chat-transport output that exercises each transport's real text rendering.
 
-    Each transport renders its own delivery, but the at-capacity sentence must
-    be the one the gate hands it via ``finalize`` — this stub records exactly
-    that call so the test can assert it verbatim against the imported constant.
+    Instead of recording the ``finalize`` argument verbatim, each sink runs the
+    answer through the same text-formatting functions the production transport
+    output uses (Slack mrkdwn + truncation, Discord markdown tightening + split,
+    Telegram HTML + truncation) before recording the user-visible text. A
+    transport-specific formatter that altered the capacity sentence would fail
+    the verbatim assertion, not just a missing one.
     """
 
     def __init__(self, *, transport: str, actor: str) -> None:
@@ -421,7 +424,44 @@ class _TransportSink:
         pass
 
     def finalize(self, answer: str) -> None:
-        self.finalized = answer
+        self.finalized = self._render(answer)
+
+    def _render(self, answer: str) -> str:
+        """Apply the transport's real ``finalize`` text formatting and return it."""
+        if self.transport == "slack":
+            return self._render_slack(answer)
+        if self.transport == "discord":
+            return self._render_discord(answer)
+        if self.transport == "telegram":
+            return self._render_telegram(answer)
+        return answer
+
+    @staticmethod
+    def _render_slack(answer: str) -> str:
+        from gateway.transports.slack.client import SLACK_MAX_MESSAGE_CHARS
+        from infrastructure.text.truncation import truncate
+        from integrations.slack import markdown_to_slack_mrkdwn
+
+        return truncate(markdown_to_slack_mrkdwn(answer), SLACK_MAX_MESSAGE_CHARS, suffix="…")
+
+    @staticmethod
+    def _render_discord(answer: str) -> str:
+        from gateway.transports.discord.client import split_discord_content
+        from infrastructure.text.markdown import tighten_markdown_emphasis
+
+        body = tighten_markdown_emphasis((answer or "").strip())
+        return "".join(split_discord_content(body))
+
+    @staticmethod
+    def _render_telegram(answer: str) -> str:
+        from infrastructure.delivery.notifications.limits import MAX_MESSAGE_SIZE
+        from infrastructure.text.truncation import truncate
+        from integrations.telegram.delivery import truncate_for_telegram_html
+        from integrations.telegram.formatting import markdown_to_telegram_html
+
+        return truncate_for_telegram_html(
+            markdown_to_telegram_html(answer), MAX_MESSAGE_SIZE, suffix="…"
+        ) or truncate(answer, MAX_MESSAGE_SIZE, suffix="…")
 
 
 @dataclass
@@ -431,7 +471,6 @@ class _ActorSpec:
     chat_id: str
     session_id: str
     sink: _TransportSink
-    session: SessionCore
     message: str
 
 
@@ -443,8 +482,9 @@ def test_fanout_three_transports_one_capacity_sentence_and_bindings_survive(
 
     The process gate owns the at-capacity sentence: every transport rejected
     under load must receive ``AT_CAPACITY_MESSAGE`` verbatim (imported, never
-    retyped), saturation must not corrupt the actor-to-session mapping, and one
-    actor's reply must never land in another transport's sink.
+    retyped) through the transport's real text rendering, saturation must not
+    corrupt the actor-to-session mapping, and one actor's reply must never land
+    in another transport's sink.
     """
     import sys
     import types
@@ -465,7 +505,10 @@ def test_fanout_three_transports_one_capacity_sentence_and_bindings_survive(
     n_actors = 12
     limit = 4
 
-    # Arrange: 4 actors per transport, each pre-bound to its own session.
+    # Arrange: 4 actors per transport, each pre-bound to its own session. The
+    # worker resolves the session from the binding store at turn time (as a
+    # transport dispatcher does), not from a pre-built object, so concurrent
+    # resolution under saturation is exercised — not just pre/post reads.
     actors: list[_ActorSpec] = []
     for i in range(n_actors):
         transport = _FANOUT_TRANSPORTS[i // 4]
@@ -486,7 +529,6 @@ def test_fanout_three_transports_one_capacity_sentence_and_bindings_survive(
                 chat_id=chat_id,
                 session_id=session_id,
                 sink=_TransportSink(transport=transport, actor=actor_id),
-                session=SessionCore(store=InMemorySessionStore(), session_id=session_id),
                 message=f"hello-{actor_id}",
             )
         )
@@ -547,11 +589,35 @@ def test_fanout_three_transports_one_capacity_sentence_and_bindings_survive(
 
     def _worker(spec: _ActorSpec) -> None:
         try:
+            # Resolve the session from the binding store the way a transport
+            # dispatcher does — concurrently with every other worker — so a
+            # binding misroute or store corruption under saturation surfaces
+            # here, not only in the post-turn check.
+            resolved = store.get_session_id(
+                platform=spec.transport,
+                chat_id=spec.chat_id,
+                principal=ACME,
+                actor=spec.actor_id,
+            )
+            assert resolved == spec.session_id, (
+                f"pre-turn resolution mismatch for {spec.transport}/{spec.actor_id}: {resolved!r}"
+            )
+            session = SessionCore(store=InMemorySessionStore(), session_id=resolved)
             runner(
                 spec.message,
-                spec.session,
+                session,
                 spec.sink,
                 logging.getLogger("test.fanout"),
+            )
+            # Post-turn: the binding must still resolve to the same session.
+            post = store.get_session_id(
+                platform=spec.transport,
+                chat_id=spec.chat_id,
+                principal=ACME,
+                actor=spec.actor_id,
+            )
+            assert post == spec.session_id, (
+                f"post-turn binding lost for {spec.transport}/{spec.actor_id}: {post!r}"
             )
         except Exception as exc:
             errors.append(exc)
@@ -574,15 +640,15 @@ def test_fanout_three_transports_one_capacity_sentence_and_bindings_survive(
     assert not errors, [repr(e) for e in errors]
     assert peak == limit, f"expected {limit} turns in flight at the peak, got {peak}"
 
-    # Every rejected actor received AT_CAPACITY_MESSAGE verbatim — the imported
-    # constant, never a retyped sentence.
+    # Every rejected actor received AT_CAPACITY_MESSAGE verbatim through the
+    # transport's real text rendering — the imported constant, never retyped.
     ran = [a for a in actors if a.sink.finalized and a.sink.finalized != AT_CAPACITY_MESSAGE]
     rejected = [a for a in actors if a.sink.finalized == AT_CAPACITY_MESSAGE]
     assert len(ran) == limit
     assert len(rejected) == n_actors - limit
     for a in rejected:
         assert a.sink.finalized == AT_CAPACITY_MESSAGE, (
-            f"{a.transport}/{a.actor_id} got a different capacity sentence"
+            f"{a.transport}/{a.actor_id} rendered a different capacity sentence"
         )
 
     # No binding lost: every actor still resolves to its own session.
