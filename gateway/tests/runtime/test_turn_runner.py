@@ -752,10 +752,16 @@ def test_turn_runner_same_session_turns_do_not_interleave(monkeypatch: Any) -> N
     up one layer.  The per-session lock in SessionAgentPool is held for the
     whole turn (dispatch).  A second turn for the same session must wait
     outside the lock — its dispatch cannot run until the first releases.
+
+    The first dispatch blocks on a test-controlled Event (no timeout), and
+    the second thread signals a handshake before attempting dispatch, so the
+    test can prove the second tried and was blocked — not merely unscheduled.
     """
+    release = threading.Event()
     first_entered = threading.Event()
+    second_started = threading.Event()
+    second_entered = threading.Event()
     overlapped = threading.Event()
-    order: list[str] = []
     call_lock = threading.Lock()
     call_count = 0
 
@@ -766,10 +772,12 @@ def test_turn_runner_same_session_turns_do_not_interleave(monkeypatch: Any) -> N
             n = call_count
         if n == 1:
             first_entered.set()
-            if overlapped.wait(timeout=2):
-                order.append("OVERLAP")
+            release.wait(timeout=10)
             return _turn_result_with_text(message)
-        overlapped.set()
+        second_entered.set()
+        if not release.is_set():
+            overlapped.set()
+        release.wait(timeout=10)
         return _turn_result_with_text(message)
 
     factory = _patch_headless_agent(monkeypatch, _turn_result_with_text(""))
@@ -790,6 +798,8 @@ def test_turn_runner_same_session_turns_do_not_interleave(monkeypatch: Any) -> N
     errors: list[Exception] = []
 
     def _run(message: str, sink: Any) -> None:
+        if message == "beta":
+            second_started.set()
         try:
             results[message] = handler.run(message, session, sink, logger)
         except Exception as exc:
@@ -798,17 +808,31 @@ def test_turn_runner_same_session_turns_do_not_interleave(monkeypatch: Any) -> N
     t1 = threading.Thread(target=_run, args=("alpha", sink_1))
     t2 = threading.Thread(target=_run, args=("beta", sink_2))
 
-    # Act — the first dispatch holds the lock while blocked on ``overlapped``.
-    # If serialized, the second cannot enter dispatch until the first releases.
+    # Act — the first dispatch holds the lock while blocked on ``release``.
     t1.start()
     assert first_entered.wait(timeout=5), "first turn never entered dispatch"
     t2.start()
-    t1.join(timeout=10)
-    t2.join(timeout=10)
+    # Handshake: the second thread is running and heading for the lock.
+    assert second_started.wait(timeout=5), "second thread never started"
+
+    # If the lock works, the second is blocked and ``second_entered`` is
+    # never set.  If the lock is bypassed, the second enters dispatch almost
+    # immediately and sets ``second_entered`` (and ``overlapped``).
+    try:
+        assert not second_entered.wait(timeout=0.5), (
+            "second dispatch entered while first still held the lock"
+        )
+        assert not overlapped.is_set(), "turns interleaved"
+    finally:
+        release.set()
+
+    t1.join(timeout=5)
+    t2.join(timeout=5)
 
     # Assert — no overlap and each sink got exactly one turn's text.
     assert not errors, errors
-    assert "OVERLAP" not in order, order
+    assert not overlapped.is_set(), "turns interleaved"
+    assert second_entered.is_set(), "second dispatch never ran after first released"
     assert results.get("alpha") is not None
     assert results.get("beta") is not None
     assert sink_1.finalized == "alpha"
