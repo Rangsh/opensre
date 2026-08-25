@@ -14,20 +14,31 @@ for lost rows, unreadable JSON, and cross-actor session bleed.
 from __future__ import annotations
 
 import json
+import logging
 import multiprocessing
 import threading
 import time
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
+from rich.console import Console
 
 from config.constants import paths
 from config.constants.billing import ORGANIZATION_ID_ENV
 from config.principal import Actor, Principal, StorageScope
 from config.scope_context import bound_storage_scope
+from core.agent_harness.session import SessionCore
 from core.agent_harness.session.persistence.jsonl_store import JsonlSessionStore
+from core.agent_harness.session.persistence.memory import InMemorySessionStore
 from core.agent_harness.session.persistence.paths import session_path, sessions_dir
+from core.agent_harness.turns.turn_results import ToolCallingTurnResult, TurnResult
 from gateway.core.storage.session.file_bindings import FileBindingStore
+from infrastructure.turn_host.concurrency import AT_CAPACITY_MESSAGE, TurnConcurrencyGate
+from tests.shared.default_headless_build_stub import default_headless_build_stub
+from tests.shared.fake_agent import fake_agent
 
 ACME = Principal.org("org_acme")
 ALICE = "U_ALICE"
@@ -362,3 +373,234 @@ def test_same_session_concurrent_appends_remain_line_parseable() -> None:
     assert len(messages) == 80
     contents = {r.get("content") for r in messages}
     assert {f"a-{i}" for i in range(40)} | {f"b-{i}" for i in range(40)} <= contents
+
+
+# ── Transport fan-out capacity ────────────────────────────────────────────────
+
+
+_FANOUT_TRANSPORTS = ("slack", "telegram", "discord")
+
+
+class _TransportSink:
+    """Stub chat-transport output: records the finalized reply for one actor.
+
+    Each transport renders its own delivery, but the at-capacity sentence must
+    be the one the gate hands it via ``finalize`` — this stub records exactly
+    that call so the test can assert it verbatim against the imported constant.
+    """
+
+    def __init__(self, *, transport: str, actor: str) -> None:
+        self.transport = transport
+        self.actor = actor
+        self.finalized: str | None = None
+        # ``TurnRunner`` reads ``tool_hooks`` onto the turn binding; ``None`` is
+        # the chat default (no approval gate).
+        self.tool_hooks = None
+
+    def print(self, message: str = "") -> None:
+        pass
+
+    def render_response_header(self, label: str) -> None:
+        pass
+
+    def render_error(self, message: str) -> None:
+        pass
+
+    def stream(
+        self,
+        *,
+        label: str,
+        chunks: Iterable[str],
+        suppress_if_starts_with: str | None = None,
+        defer_want_me_to_closer: bool = False,
+    ) -> str:
+        _ = (label, suppress_if_starts_with, defer_want_me_to_closer)
+        return "".join(str(chunk) for chunk in chunks)
+
+    def set_tool_status(self, status: str) -> None:
+        pass
+
+    def finalize(self, answer: str) -> None:
+        self.finalized = answer
+
+
+@dataclass
+class _ActorSpec:
+    transport: str
+    actor_id: str
+    chat_id: str
+    session_id: str
+    sink: _TransportSink
+    session: SessionCore
+    message: str
+
+
+def test_fanout_three_transports_one_capacity_sentence_and_bindings_survive(
+    bindings_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """12 actors across Slack/Telegram/Discord, limit 4: one capacity sentence, no binding lost, no bleed.
+
+    The process gate owns the at-capacity sentence: every transport rejected
+    under load must receive ``AT_CAPACITY_MESSAGE`` verbatim (imported, never
+    retyped), saturation must not corrupt the actor-to-session mapping, and one
+    actor's reply must never land in another transport's sink.
+    """
+    import sys
+    import types
+
+    # ``turn_memory`` imports the Unix-only ``resource`` module unconditionally;
+    # stub it on Windows so the gate path can be exercised locally. On Linux the
+    # real module is already imported and this is a no-op.
+    if sys.platform == "win32" and "resource" not in sys.modules:
+        _resource_stub = types.ModuleType("resource")
+        _resource_stub.RUSAGE_SELF = 0
+        _resource_stub.getrusage = lambda _who: types.SimpleNamespace(ru_maxrss=0)
+        _resource_stub.getpagesize = lambda: 4096
+        monkeypatch.setitem(sys.modules, "resource", _resource_stub)
+
+    from infrastructure.turn_host.turn_runner import TurnRunner
+
+    store = FileBindingStore(bindings_path)
+    n_actors = 12
+    limit = 4
+
+    # Arrange: 4 actors per transport, each pre-bound to its own session.
+    actors: list[_ActorSpec] = []
+    for i in range(n_actors):
+        transport = _FANOUT_TRANSPORTS[i // 4]
+        actor_id = f"U_{i:03d}"
+        chat_id = f"{transport}:chat:{i:03d}"
+        session_id = f"sess-{i:03d}"
+        store.bind(
+            platform=transport,
+            chat_id=chat_id,
+            session_id=session_id,
+            principal=ACME,
+            actor=actor_id,
+        )
+        actors.append(
+            _ActorSpec(
+                transport=transport,
+                actor_id=actor_id,
+                chat_id=chat_id,
+                session_id=session_id,
+                sink=_TransportSink(transport=transport, actor=actor_id),
+                session=SessionCore(store=InMemorySessionStore(), session_id=session_id),
+                message=f"hello-{actor_id}",
+            )
+        )
+
+    # Barrier-controlled stub LLM: the 4 admitted turns block in dispatch so
+    # the peak is deterministic; the 8 rejected never reach it.
+    peak_barrier = threading.Barrier(limit + 1)
+    release = threading.Event()
+    inflight = {"count": 0}
+    inflight_lock = threading.Lock()
+
+    def _stub_dispatch(message: str) -> TurnResult:
+        with inflight_lock:
+            inflight["count"] += 1
+        try:
+            peak_barrier.wait(timeout=30)
+            release.wait(timeout=30)
+        finally:
+            with inflight_lock:
+                inflight["count"] -= 1
+        return TurnResult(
+            final_intent="cli_agent_handled",
+            action_result=ToolCallingTurnResult(
+                planned_count=0,
+                executed_count=0,
+                executed_success_count=0,
+                has_unhandled_clause=False,
+                handled=True,
+                response_text=f"reply-{message}",
+            ),
+        )
+
+    def _build(**_kwargs: Any) -> Any:
+        agent = fake_agent()
+        agent.dispatch.side_effect = _stub_dispatch
+        return agent
+
+    monkeypatch.setattr(
+        "infrastructure.turn_host.session_agents.DefaultHeadlessBuild",
+        default_headless_build_stub(_build),
+    )
+    monkeypatch.setattr(
+        "infrastructure.turn_host.turn_runner.capture_gateway_turn_started", lambda **_: None
+    )
+    monkeypatch.setattr(
+        "infrastructure.turn_host.turn_runner.capture_gateway_turn_completed", lambda **_: None
+    )
+    monkeypatch.setattr(
+        "infrastructure.turn_host.turn_runner.capture_gateway_turn_failed", lambda **_: None
+    )
+
+    runner = TurnRunner(
+        console=Console(force_terminal=False),
+        gate=TurnConcurrencyGate(limit),
+    )
+
+    errors: list[Exception] = []
+
+    def _worker(spec: _ActorSpec) -> None:
+        try:
+            runner(
+                spec.message,
+                spec.session,
+                spec.sink,
+                logging.getLogger("test.fanout"),
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=_worker, args=(spec,), name=f"fanout-{spec.actor_id}")
+        for spec in actors
+    ]
+    for t in threads:
+        t.start()
+
+    # The barrier opens once the 4 admitted turns are in dispatch plus the main
+    # thread — that moment is the peak.
+    peak_barrier.wait(timeout=30)
+    with inflight_lock:
+        peak = inflight["count"]
+    release.set()
+    _join(threads)
+
+    assert not errors, [repr(e) for e in errors]
+    assert peak == limit, f"expected {limit} turns in flight at the peak, got {peak}"
+
+    # Every rejected actor received AT_CAPACITY_MESSAGE verbatim — the imported
+    # constant, never a retyped sentence.
+    ran = [a for a in actors if a.sink.finalized and a.sink.finalized != AT_CAPACITY_MESSAGE]
+    rejected = [a for a in actors if a.sink.finalized == AT_CAPACITY_MESSAGE]
+    assert len(ran) == limit
+    assert len(rejected) == n_actors - limit
+    for a in rejected:
+        assert a.sink.finalized == AT_CAPACITY_MESSAGE, (
+            f"{a.transport}/{a.actor_id} got a different capacity sentence"
+        )
+
+    # No binding lost: every actor still resolves to its own session.
+    for a in actors:
+        got = store.get_session_id(
+            platform=a.transport, chat_id=a.chat_id, principal=ACME, actor=a.actor_id
+        )
+        assert got == a.session_id, f"binding lost for {a.transport}/{a.actor_id}: got {got!r}"
+
+    # No cross-actor bleed: no sink holds another actor's reply or message.
+    for a in actors:
+        text = a.sink.finalized or ""
+        for other in actors:
+            if other is a:
+                continue
+            assert other.message not in text, (
+                f"bleed: {other.actor_id}'s message in {a.actor_id}'s sink ({a.transport})"
+            )
+            assert f"reply-{other.message}" not in text, (
+                f"bleed: {other.actor_id}'s reply in {a.actor_id}'s sink ({a.transport})"
+            )
