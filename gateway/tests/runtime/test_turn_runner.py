@@ -749,13 +749,16 @@ def test_turn_runner_same_session_turns_do_not_interleave(monkeypatch: Any) -> N
     """Two turns for one session through TurnRunner must serialize.
 
     Port of ``test_session_agents.test_same_session_turns_do_not_interleave``
-    up one layer.  The per-session lock in SessionAgentPool is held for the
-    whole turn (dispatch).  A second turn for the same session must wait
-    outside the lock — its dispatch cannot run until the first releases.
+    up one layer.  The per-session lock is held for the whole turn so a second
+    turn cannot rebind the pooled ``BindableOutput`` while the first is still
+    dispatching — without it, the first turn's remaining write lands on the
+    second turn's sink.
 
-    The first dispatch blocks on a test-controlled Event (no timeout), and
-    the second thread signals a handshake before attempting dispatch, so the
-    test can prove the second tried and was blocked — not merely unscheduled.
+    Serialization is pinned by the overlap / second-entered handshake.
+    Sink isolation is pinned by writing through the pooled ``BindableOutput``
+    (not ``TurnRunner``'s stack-local ``output.finalize``): that local finalize
+    still hits the per-call sink even when the lock is gone, so it cannot
+    detect the bleed #5493 named.
     """
     release = threading.Event()
     first_entered = threading.Event()
@@ -764,24 +767,6 @@ def test_turn_runner_same_session_turns_do_not_interleave(monkeypatch: Any) -> N
     overlapped = threading.Event()
     call_lock = threading.Lock()
     call_count = 0
-
-    def _dispatch(message: str) -> TurnResult:
-        nonlocal call_count
-        with call_lock:
-            call_count += 1
-            n = call_count
-        if n == 1:
-            first_entered.set()
-            release.wait(timeout=10)
-            return _turn_result_with_text(message)
-        second_entered.set()
-        if not release.is_set():
-            overlapped.set()
-        release.wait(timeout=10)
-        return _turn_result_with_text(message)
-
-    factory = _patch_headless_agent(monkeypatch, _turn_result_with_text(""))
-    factory.return_value.dispatch.side_effect = _dispatch
 
     from infrastructure.turn_host.concurrency import TurnConcurrencyGate
 
@@ -793,6 +778,32 @@ def test_turn_runner_same_session_turns_do_not_interleave(monkeypatch: Any) -> N
     sink_1 = RecordingTurnOutput()
     sink_2 = RecordingTurnOutput()
     logger = logging.getLogger("test.serialize.same_session")
+
+    def _write_through_bound_output(message: str) -> None:
+        # The real agent writes through this BindableOutput; rebinding it mid-
+        # turn is the bleed path.  TurnRunner's stack-local finalize is not.
+        bound = handler._pool._outputs[session.session_id]  # noqa: SLF001
+        bound.print(message)
+
+    def _dispatch(message: str) -> TurnResult:
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            n = call_count
+        if n == 1:
+            first_entered.set()
+            release.wait(timeout=10)
+            _write_through_bound_output(message)
+            return _turn_result_with_text(message)
+        second_entered.set()
+        if not release.is_set():
+            overlapped.set()
+        release.wait(timeout=10)
+        _write_through_bound_output(message)
+        return _turn_result_with_text(message)
+
+    factory = _patch_headless_agent(monkeypatch, _turn_result_with_text(""))
+    factory.return_value.dispatch.side_effect = _dispatch
 
     results: dict[str, TurnResult | None] = {}
     errors: list[Exception] = []
@@ -829,11 +840,17 @@ def test_turn_runner_same_session_turns_do_not_interleave(monkeypatch: Any) -> N
     t1.join(timeout=5)
     t2.join(timeout=5)
 
-    # Assert — no overlap and each sink got exactly one turn's text.
+    # Assert — no overlap, and each bound-output write hit its own sink.
     assert not errors, errors
     assert not overlapped.is_set(), "turns interleaved"
     assert second_entered.is_set(), "second dispatch never ran after first released"
     assert results.get("alpha") is not None
     assert results.get("beta") is not None
-    assert sink_1.finalized == "alpha"
-    assert sink_2.finalized == "beta"
+    assert sink_1.lines == ["alpha"], (
+        "first turn's bound-output write must stay on sink_1 "
+        f"(got {sink_1.lines!r}; sink_2={sink_2.lines!r})"
+    )
+    assert sink_2.lines == ["beta"], (
+        "second turn's bound-output write must stay on sink_2 "
+        f"(got {sink_2.lines!r}; sink_1={sink_1.lines!r})"
+    )
