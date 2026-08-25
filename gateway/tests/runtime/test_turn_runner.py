@@ -133,6 +133,22 @@ def _empty_turn_result(*, llm_run: Any = None) -> TurnResult:
     )
 
 
+def _turn_result_with_text(text: str) -> TurnResult:
+    """A handled turn whose primary response is ``text`` (not streamed, not answered)."""
+    return TurnResult(
+        final_intent="cli_agent_handled",
+        action_result=ToolCallingTurnResult(
+            planned_count=0,
+            executed_count=0,
+            executed_success_count=0,
+            has_unhandled_clause=False,
+            handled=True,
+            response_text=text,
+        ),
+        assistant_response_text=text,
+    )
+
+
 def test_turn_runner_continues_outer_loop_for_active_session_goal(
     monkeypatch: Any,
 ) -> None:
@@ -656,3 +672,161 @@ def test_run_cancelled_during_successful_admission_still_starts_turn(
 
     assert returned is not None
     factory.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("cancelled_msg", "survivor_msg"),
+    [
+        ("alpha", "beta"),
+        ("beta", "alpha"),
+    ],
+    ids=["cancel-alpha-survive-beta", "cancel-beta-survive-alpha"],
+)
+def test_turn_runner_cancel_under_overlap_releases_slot_and_preserves_survivor(
+    monkeypatch: Any,
+    tmp_path: Any,
+    cancelled_msg: str,
+    survivor_msg: str,
+) -> None:
+    """Cancelling a turn while another session's turn runs is clean.
+
+    The cancel path skips the normal dispatch return, so it is where a capacity
+    slot is most likely to leak. Under overlap — two sessions, both turns
+    provably in flight before the cancel — cancelling one turn must:
+
+    * release the cancelled turn's capacity slot (the gate reflects only the
+      survivor afterward),
+    * leave the survivor's reply untouched, and
+    * keep the cancelled session's JSONL file readable end to end (no torn line
+      from a flush interrupted mid-append).
+
+    Cancel is driven through :class:`ActiveTurnRegistry` — the path a
+    transport's ``/stop`` takes — not by reaching into the runner's internals.
+    The case is run twice with the roles reversed so it does not depend on
+    whichever turn happened to start first.
+    """
+    import json
+
+    from core.agent_harness.session.persistence.jsonl_store import JsonlSessionStore
+    from core.agent_harness.session.persistence.paths import session_path
+    from gateway.core.middleware.active_turns import ActiveTurnRegistry
+    from infrastructure.turn_host.concurrency import TurnConcurrencyGate
+
+    # Session JSONL files land under OPENSRE_HOME_DIR; redirect to tmp_path so the
+    # cancelled session's file is isolated and inspectable after the run.
+    monkeypatch.setattr("config.constants.paths.OPENSRE_HOME_DIR", tmp_path)
+
+    release = threading.Event()  # barrier the survivor blocks on until released
+    entered_cancelled = threading.Event()
+    entered_survivor = threading.Event()
+    cancel_event = threading.Event()  # the cancelled turn's ``turn_cancel`` Event
+
+    def _dispatch(message: str) -> TurnResult:
+        if message == cancelled_msg:
+            entered_cancelled.set()
+            # Block until /stop sets the cancel event, then return. A real turn
+            # checks cancel between LLM/tool iterations; the fake blocks on the
+            # same Event the registry sets.
+            cancel_event.wait(timeout=10)
+            return _turn_result_with_text("")
+        entered_survivor.set()
+        release.wait(timeout=10)
+        return _turn_result_with_text(f"reply-{message}")
+
+    factory = _patch_headless_agent(monkeypatch, _turn_result_with_text(""))
+    factory.return_value.dispatch.side_effect = _dispatch
+
+    # Limit 2: both turns fill the gate, so a leaked slot leaves zero free and
+    # the survivor cannot be mistaken for the leak.
+    gate = TurnConcurrencyGate(2)
+    handler = TurnRunner(console=Console(force_terminal=False), gate=gate)
+    logger = logging.getLogger("test.cancel.overlap")
+
+    # Cancelled session: pre-attach the cancel Event so the registry and the
+    # runner share one signal, and seed a turn so flush writes an end-of-session
+    # leaf (an empty session file is otherwise unlinked on flush).
+    store_cancelled = JsonlSessionStore()
+    session_cancelled = SessionCore(store=store_cancelled)
+    store_cancelled.open_session(session_cancelled)
+    store_cancelled.append_turn(session_cancelled, "chat", cancelled_msg)
+    sink_cancelled = RecordingTurnOutput()
+    sink_cancelled.turn_cancel = cancel_event
+
+    # Survivor session: no cancel Event; runs to completion.
+    store_survivor = JsonlSessionStore()
+    session_survivor = SessionCore(store=store_survivor)
+    store_survivor.open_session(session_survivor)
+    store_survivor.append_turn(session_survivor, "chat", survivor_msg)
+    sink_survivor = RecordingTurnOutput()
+
+    registry = ActiveTurnRegistry()
+    results: dict[str, TurnResult | None] = {}
+    errors: list[Exception] = []
+
+    def _run_cancelled() -> None:
+        try:
+            with registry.track(cancelled_msg, cancel_event):
+                results[cancelled_msg] = handler.run(
+                    cancelled_msg, session_cancelled, sink_cancelled, logger
+                )
+        except Exception as exc:
+            errors.append(exc)
+
+    def _run_survivor() -> None:
+        try:
+            results[survivor_msg] = handler.run(
+                survivor_msg, session_survivor, sink_survivor, logger
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    t_cancelled = threading.Thread(target=_run_cancelled)
+    t_survivor = threading.Thread(target=_run_survivor)
+    t_cancelled.start()
+    t_survivor.start()
+
+    # Both turns must reach dispatch before the cancel — proving overlap.
+    assert entered_cancelled.wait(timeout=10), "cancelled turn never entered dispatch"
+    assert entered_survivor.wait(timeout=10), "survivor turn never entered dispatch"
+
+    # Cancel via the path a transport /stop takes: request_stop sets the tracked
+    # turn_cancel Event outside the turn lock.
+    assert registry.request_stop(cancelled_msg) is True
+
+    # The finally unblocks the survivor and joins both threads even when a slot
+    # assertion fails, so a leaked-slot failure cannot leave a thread behind.
+    probe_acquired = False
+    try:
+        # The cancelled turn returns from dispatch, flushes, and releases its slot.
+        t_cancelled.join(timeout=10)
+        assert not t_cancelled.is_alive(), "cancelled turn did not return after stop"
+
+        # Slot assertion: the cancelled turn released its permit, so exactly one
+        # slot is free (the survivor still holds the other). If the cancel path
+        # leaked, the first try_acquire fails — the process would answer "at
+        # capacity" forever.
+        probe_acquired = gate.try_acquire()
+        assert probe_acquired is True, "cancelled turn leaked its capacity slot"
+        assert gate.try_acquire() is False, "survivor's slot was disturbed by the cancel"
+
+        # Release the survivor; it must complete with its own reply, untouched.
+        release.set()
+        t_survivor.join(timeout=10)
+        assert not t_survivor.is_alive(), "survivor turn did not complete"
+        assert not errors, errors
+        assert sink_survivor.finalized == f"reply-{survivor_msg}"
+        assert results[survivor_msg] is not None
+
+        # The cancelled session's JSONL must parse end to end — no torn line
+        # from a flush interrupted mid-append (a real /stop leaves it readable).
+        cancelled_path = session_path(session_cancelled.session_id)
+        assert cancelled_path.exists(), f"cancelled session file missing: {cancelled_path}"
+        for line in cancelled_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                json.loads(line)  # raises JSONDecodeError on a torn tail
+    finally:
+        if probe_acquired:
+            gate.release()  # return the probe so the survivor's slot accounting stands
+        release.set()
+        t_cancelled.join(timeout=10)
+        t_survivor.join(timeout=10)
