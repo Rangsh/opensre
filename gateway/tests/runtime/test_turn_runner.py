@@ -133,6 +133,22 @@ def _empty_turn_result(*, llm_run: Any = None) -> TurnResult:
     )
 
 
+def _turn_result_with_text(text: str) -> TurnResult:
+    """A handled turn whose primary response is ``text`` (not streamed, not answered)."""
+    return TurnResult(
+        final_intent="cli_agent_handled",
+        action_result=ToolCallingTurnResult(
+            planned_count=0,
+            executed_count=0,
+            executed_success_count=0,
+            has_unhandled_clause=False,
+            handled=True,
+            response_text=text,
+        ),
+        assistant_response_text=text,
+    )
+
+
 def test_turn_runner_continues_outer_loop_for_active_session_goal(
     monkeypatch: Any,
 ) -> None:
@@ -656,3 +672,144 @@ def test_run_cancelled_during_successful_admission_still_starts_turn(
 
     assert returned is not None
     factory.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency tests — ported up from test_session_agents.py to the door every
+# host actually goes through.  The pool tests prove the lock works when the pool
+# is called correctly; these prove TurnRunner calls it correctly.
+# ---------------------------------------------------------------------------
+
+
+def test_turn_runner_concurrent_sessions_do_not_bleed(monkeypatch: Any) -> None:
+    """Two sessions through TurnRunner run concurrently; each sink gets only its own text.
+
+    Port of ``test_session_agents.test_different_sessions_still_run_concurrently``
+    up one layer.  Different sessions take different per-session locks, so with a
+    raised capacity gate both turns must overlap inside dispatch — proved by a
+    controllable Event neither dispatch can pass until the test releases it.
+    """
+    release = threading.Event()
+    entered_alpha = threading.Event()
+    entered_beta = threading.Event()
+
+    def _dispatch(message: str) -> TurnResult:
+        if message == "alpha":
+            entered_alpha.set()
+        else:
+            entered_beta.set()
+        release.wait(timeout=10)
+        return _turn_result_with_text(f"reply-{message}")
+
+    factory = _patch_headless_agent(monkeypatch, _turn_result_with_text(""))
+    factory.return_value.dispatch.side_effect = _dispatch
+
+    from infrastructure.turn_host.concurrency import TurnConcurrencyGate
+
+    handler = TurnRunner(
+        console=Console(force_terminal=False),
+        gate=TurnConcurrencyGate(4),
+    )
+    session_a = SessionCore(store=InMemorySessionStore())
+    session_b = SessionCore(store=InMemorySessionStore())
+    sink_a = RecordingTurnOutput()
+    sink_b = RecordingTurnOutput()
+    logger = logging.getLogger("test.concurrent.sessions")
+
+    results: dict[str, TurnResult | None] = {}
+    errors: list[Exception] = []
+
+    def _run(message: str, session: SessionCore, sink: Any) -> None:
+        try:
+            results[message] = handler.run(message, session, sink, logger)
+        except Exception as exc:
+            errors.append(exc)
+
+    t_a = threading.Thread(target=_run, args=("alpha", session_a, sink_a))
+    t_b = threading.Thread(target=_run, args=("beta", session_b, sink_b))
+
+    # Act — both threads must reach dispatch before either can proceed.
+    t_a.start()
+    t_b.start()
+    assert entered_alpha.wait(timeout=10), "session A never entered dispatch"
+    assert entered_beta.wait(timeout=10), "session B never entered dispatch"
+    release.set()
+    t_a.join(timeout=10)
+    t_b.join(timeout=10)
+
+    # Assert — both returned, and neither sink received the other session's text.
+    assert not errors, errors
+    assert results.get("alpha") is not None
+    assert results.get("beta") is not None
+    assert sink_a.finalized == "reply-alpha"
+    assert sink_b.finalized == "reply-beta"
+
+
+def test_turn_runner_same_session_turns_do_not_interleave(monkeypatch: Any) -> None:
+    """Two turns for one session through TurnRunner must serialize.
+
+    Port of ``test_session_agents.test_same_session_turns_do_not_interleave``
+    up one layer.  The per-session lock in SessionAgentPool is held for the
+    whole turn (dispatch).  A second turn for the same session must wait
+    outside the lock — its dispatch cannot run until the first releases.
+    """
+    first_entered = threading.Event()
+    overlapped = threading.Event()
+    order: list[str] = []
+    call_lock = threading.Lock()
+    call_count = 0
+
+    def _dispatch(message: str) -> TurnResult:
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            n = call_count
+        if n == 1:
+            first_entered.set()
+            if overlapped.wait(timeout=2):
+                order.append("OVERLAP")
+            return _turn_result_with_text(message)
+        overlapped.set()
+        return _turn_result_with_text(message)
+
+    factory = _patch_headless_agent(monkeypatch, _turn_result_with_text(""))
+    factory.return_value.dispatch.side_effect = _dispatch
+
+    from infrastructure.turn_host.concurrency import TurnConcurrencyGate
+
+    handler = TurnRunner(
+        console=Console(force_terminal=False),
+        gate=TurnConcurrencyGate(4),
+    )
+    session = SessionCore(store=InMemorySessionStore())
+    sink_1 = RecordingTurnOutput()
+    sink_2 = RecordingTurnOutput()
+    logger = logging.getLogger("test.serialize.same_session")
+
+    results: dict[str, TurnResult | None] = {}
+    errors: list[Exception] = []
+
+    def _run(message: str, sink: Any) -> None:
+        try:
+            results[message] = handler.run(message, session, sink, logger)
+        except Exception as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_run, args=("alpha", sink_1))
+    t2 = threading.Thread(target=_run, args=("beta", sink_2))
+
+    # Act — the first dispatch holds the lock while blocked on ``overlapped``.
+    # If serialized, the second cannot enter dispatch until the first releases.
+    t1.start()
+    assert first_entered.wait(timeout=5), "first turn never entered dispatch"
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    # Assert — no overlap and each sink got exactly one turn's text.
+    assert not errors, errors
+    assert "OVERLAP" not in order, order
+    assert results.get("alpha") is not None
+    assert results.get("beta") is not None
+    assert sink_1.finalized == "alpha"
+    assert sink_2.finalized == "beta"
