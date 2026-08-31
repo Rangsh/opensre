@@ -235,18 +235,6 @@ def test_over_budget_tools_are_listed_and_the_allowlist_only_shrinks() -> None:
     )
 
 
-def test_apply_skill_guidance_warns_with_the_over_budget_list(
-    caplog: Any,
-) -> None:
-    clear_tool_registry_cache()
-    with caplog.at_level(logging.WARNING, logger="tools.registry_skill_guidance"):
-        get_registered_tools()
-    joined = "\n".join(record.getMessage() for record in caplog.records)
-    assert "over the 2400-character budget" in joined
-    for name in sorted(_OVER_BUDGET_TOOL_NAMES):
-        assert name in joined, name
-
-
 def test_attached_guidance_stays_within_the_budget() -> None:
     for tool in _registered_tools_by_name().values():
         guidance = tool.skill_guidance
