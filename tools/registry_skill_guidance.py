@@ -45,9 +45,13 @@ def _skill_guidance_files() -> tuple[Path, ...]:
 
 
 def _is_token_char(ch: str) -> bool:
-    """Return whether ``ch`` continues an identifier-like token (e.g. ``foo_bar``)."""
+    """Return whether ``ch`` continues a token (any non-whitespace character).
 
-    return ch.isalnum() or ch == "_"
+    Hyphenated names, CLI flags, dotted identifiers, paths, and URLs must stay
+    intact when a whitespace boundary exists earlier in the slice.
+    """
+
+    return not ch.isspace()
 
 
 def _truncate_skill_guidance(text: str) -> str:
@@ -92,7 +96,6 @@ def apply_skill_guidance(
         known_tool_names if known_tool_names is not None else frozenset(tools_by_name)
     )
     guidance_by_tool: dict[str, list[str]] = {}
-    over_budget: list[str] = []
 
     for skill_path in _skill_guidance_files():
         result = load_tool_skill_guidance(skill_path, known_tool_names=diagnostic_names)
@@ -107,12 +110,20 @@ def apply_skill_guidance(
         if skill is None or skill.disable_model_invocation:
             continue
         guidance = format_tool_skill_guidance(skill)
-        if len(guidance) > _MAX_TOOL_SKILL_GUIDANCE_CHARS:
-            over_budget.append(f"{skill.name} ({len(guidance)} chars)")
         for tool_name in skill.tool_names:
             if tool_name not in tools_by_name:
                 continue
             guidance_by_tool.setdefault(tool_name, []).append(guidance)
+
+    over_budget: list[str] = []
+    for tool_name, guidances in guidance_by_tool.items():
+        combined = "\n\n".join(guidances)
+        if len(combined) > _MAX_TOOL_SKILL_GUIDANCE_CHARS:
+            over_budget.append(f"{tool_name} ({len(combined)} chars)")
+        tools_by_name[tool_name] = _with_skill_guidance(
+            tools_by_name[tool_name],
+            _truncate_skill_guidance(combined),
+        )
 
     if over_budget:
         logger.warning(
@@ -120,7 +131,3 @@ def apply_skill_guidance(
             _MAX_TOOL_SKILL_GUIDANCE_CHARS,
             ", ".join(over_budget),
         )
-
-    for tool_name, guidances in guidance_by_tool.items():
-        combined = _truncate_skill_guidance("\n\n".join(guidances))
-        tools_by_name[tool_name] = _with_skill_guidance(tools_by_name[tool_name], combined)
