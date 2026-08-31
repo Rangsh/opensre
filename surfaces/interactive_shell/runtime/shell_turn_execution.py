@@ -1,8 +1,6 @@
 """One interactive-shell turn: build (or reuse) the shell agent, then ``handle``.
 
-The shell's ports are supplied by ``shell_agent``; the agent's own stages run.
-A test that injects a whole stage (``execute_actions`` / ``gather_evidence`` /
-``answer_agent``) goes through the seams in ``turn_seams``.
+The shell's ports are supplied by ``shell_agent``; the agent's own ReAct stage runs.
 """
 
 from __future__ import annotations
@@ -28,6 +26,7 @@ from surfaces.interactive_shell.runtime.core.turn_accounting import ShellTurnAcc
 from surfaces.interactive_shell.runtime.shell_agent import shell_agent_build_config
 from surfaces.interactive_shell.session import Session
 from surfaces.interactive_shell.telemetry import PromptRecorder
+from surfaces.shared.terminal.components.rendering import print_repl_text
 
 
 def execute_shell_turn(
@@ -47,7 +46,7 @@ def execute_shell_turn(
 
     The same :class:`TurnRunner` the chat transports use, built with the
     shell's own :func:`shell_agent_build_config` so the REPL keeps its tools,
-    prompts and gather phase. Pass a long-lived ``handler`` (the REPL builds one
+    prompts. Pass a long-lived ``handler`` (the REPL builds one
     at startup) so the tool stack is not rebuilt every turn.
     """
     resolved_output: TurnOutput = output if output is not None else ShellOutputSink(console)
@@ -65,7 +64,8 @@ def execute_shell_turn(
         rendered = format_session_goal_progress(goal, session=session)
         if rendered:
             # Checklist uses ``[x]`` / ``[ ]`` — Rich markup must stay off.
-            console.print(rendered, markup=False)
+            # CRLF under patch_stdout(raw=True) so rows do not staircase.
+            print_repl_text(console, rendered, markup=False)
 
     def _accounting(message: str) -> ShellTurnAccounting:
         return ShellTurnAccounting(session=session, text=message, recorder=recorder)
