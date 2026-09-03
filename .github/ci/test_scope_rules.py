@@ -580,6 +580,8 @@ RULES: tuple[PathRule, ...] = (
     PathRule("uv.lock", (), always_escalate=True),
     PathRule("pytest.ini", (), always_escalate=True),
     PathRule("Makefile", (), always_escalate=True),
+    PathRule(".github/workflows/", ("tests/github_ci/",)),
+    PathRule(".github/scripts/", ("tests/github_ci/",)),
     PathRule(".github/ci/", ("tests/github_ci/",)),
 )
 

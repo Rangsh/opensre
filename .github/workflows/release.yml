@@ -706,8 +706,31 @@ jobs:
           export VERSION="${VERSION#v}"
           bash .github/scripts/sync-homebrew-tap-formula.sh
 
+  wait-for-ci-gate:
+    # Rolling main-build must not replace public installer assets unless the
+    # CI workflow's required "CI Gate" job succeeded for this exact SHA.
+    # Binary builds still run in parallel; only publication waits.
+    if: needs.prepare.outputs.channel == 'main'
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Wait for CI Gate on this SHA
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          WAIT_SHA: ${{ github.sha }}
+        run: python3 .github/scripts/wait_for_ci_gate.py
+
   publish-main-release:
-    if: always() && needs.prepare.outputs.channel == 'main' && needs.build-binaries.result == 'success'
+    if: >-
+      always()
+      && needs.prepare.outputs.channel == 'main'
+      && needs.build-binaries.result == 'success'
+      && needs.wait-for-ci-gate.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -715,6 +738,7 @@ jobs:
     needs:
       - prepare
       - build-binaries
+      - wait-for-ci-gate
 
     steps:
       - uses: actions/checkout@v5
