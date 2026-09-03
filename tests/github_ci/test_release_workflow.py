@@ -25,7 +25,9 @@ def test_publish_main_release_requires_same_sha_ci_gate_success() -> None:
     wait_step = next(
         step for step in wait["steps"] if step.get("name") == "Wait for CI Gate on this SHA"
     )
-    assert wait_step["run"] == f"python3 {_WAIT_SCRIPT}"
+    assert wait_step["run"] == f"uv run python {_WAIT_SCRIPT}"
+    assert "Install uv" in {step.get("name") for step in wait["steps"]}
+    assert "Set up Python" in {step.get("name") for step in wait["steps"]}
     assert wait_step["env"]["WAIT_SHA"] == "${{ github.sha }}"
     assert "continue-on-error" not in wait
     assert "continue-on-error" not in wait_step

@@ -718,12 +718,26 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "latest-known"  # avoid live ndjson "latest" fetch flakes
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
       - name: Wait for CI Gate on this SHA
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           WAIT_SHA: ${{ github.sha }}
-        run: python3 .github/scripts/wait_for_ci_gate.py
+        run: uv run python .github/scripts/wait_for_ci_gate.py
 
   publish-main-release:
     if: >-
